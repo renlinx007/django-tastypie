@@ -1,11 +1,16 @@
 from __future__ import unicode_literals
 from __future__ import with_statement
 from copy import deepcopy
+from datetime import datetime
 import logging
+from time import mktime
 import warnings
+from wsgiref.handlers import format_date_time
 
+import django
 from django.conf import settings
 from django.conf.urls import patterns, url
+from django.contrib.gis.db.models.fields import GeometryField
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned, ValidationError
 from django.core.urlresolvers import NoReverseMatch, reverse, resolve, Resolver404, get_script_prefix
 from django.core.signals import got_request_exception
@@ -558,9 +563,19 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
         identifier = self._meta.authentication.get_identifier(request)
 
         # Check to see if they should be throttled.
-        if self._meta.throttle.should_be_throttled(identifier):
+        throttle = self._meta.throttle.should_be_throttled(identifier)
+        
+        if throttle:
             # Throttle limit exceeded.
-            raise ImmediateHttpResponse(response=http.HttpTooManyRequests())
+            
+            response = http.HttpTooManyRequests()
+            
+            if isinstance(throttle, int) and not isinstance(throttle, bool):
+                response['Retry-After'] = throttle
+            elif isinstance(throttle, datetime):
+                response['Retry-After'] = format_date_time(mktime(throttle.timetuple()))
+            
+            raise ImmediateHttpResponse(response=response)
 
     def log_throttled_access(self, request):
         """
@@ -1376,7 +1391,7 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
         deserialized = self.alter_deserialized_list_data(request, deserialized)
 
         if not self._meta.collection_name in deserialized:
-            raise BadRequest("Invalid data sent.")
+            raise BadRequest("Invalid data sent: missing '%s'" % self._meta.collection_name)
 
         basic_bundle = self.build_bundle(request=request)
         self.obj_delete_list_for_update(bundle=basic_bundle, **self.remove_api_resource_names(kwargs))
@@ -1954,6 +1969,8 @@ class BaseModelResource(Resource):
             query_terms = self._meta.queryset.query.query_terms
         else:
             query_terms = QUERY_TERMS
+        if django.VERSION >= (1, 8):
+            query_terms = query_terms | set(GeometryField.class_lookups.keys())
 
         for filter_expr, value in filters.items():
             filter_bits = filter_expr.split(LOOKUP_SEP)
